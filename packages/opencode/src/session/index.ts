@@ -22,6 +22,7 @@ import { Snapshot } from "@/snapshot"
 import type { Provider } from "@/provider/provider"
 import { PermissionNext } from "@/permission/next"
 import { Global } from "@/global"
+import { Pending } from "@/tool/pending"
 
 export namespace Session {
   const log = Log.create({ service: "session" })
@@ -352,6 +353,7 @@ export namespace Session {
 
   export const remove = fn(Identifier.schema("session"), async (sessionID) => {
     const project = Instance.project
+    Pending.clearSession(sessionID)
     try {
       const session = await get(sessionID)
       for (const child of await children(sessionID)) {

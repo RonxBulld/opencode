@@ -13,4 +13,7 @@
     "github-triage": false,
     "github-pr-search": false,
   },
+  "experimental": {
+    "model_confirm_tools": true,
+  },
 }

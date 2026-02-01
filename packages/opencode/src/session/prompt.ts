@@ -46,6 +46,8 @@ import { LLM } from "./llm"
 import { iife } from "@/util/iife"
 import { Shell } from "@/shell/shell"
 import { Truncate } from "@/tool/truncation"
+import { Config } from "@/config/config"
+import { Pending } from "@/tool/pending"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -662,6 +664,163 @@ export namespace SessionPrompt {
     using _ = log.time("resolveTools")
     const tools: Record<string, AITool> = {}
 
+    const confirmEnabled = (await Config.get()).experimental?.model_confirm_tools === true
+    const conversationKey = Pending.conversationKey(input.messages)
+
+    const safeNone = new Set(["invalid", "read", "glob", "grep", "list", "todoread", "skill", "question"])
+    const safeInternal = new Set(["apply_patch", "edit", "write", "todowrite", "task"])
+    const safeExternal = new Set(["webfetch", "websearch", "codesearch"])
+
+    const impact = (id: string, dup: boolean): Pending.Impact => {
+      if (id === "confirm" || id === "invalid") return "none"
+      if (id === "bash") return "unknown"
+      if (dup) return "unknown"
+      if (safeNone.has(id)) return "none"
+      if (safeInternal.has(id)) return "internal"
+      if (safeExternal.has(id)) return "external"
+      return "unknown"
+    }
+
+    const staged = (id: string, tool: string, impact: Pending.Impact) => {
+      return {
+        title: `Staged ${tool}`,
+        output: `Tool call staged: ${tool} (impact: ${impact}). Not executed yet.
+
+Before confirming, adversarially verify: necessity for user's goal, correctness/minimality of args & scope, and safety (secrets, irreversible changes, network/files). If not appropriate, do NOT confirm - explain why and propose a safer next step.
+
+To execute: confirm({"id":"${id}"})`,
+        metadata: {
+          staged: true,
+          id,
+          tool,
+          impact,
+        },
+      }
+    }
+
+    const stage = (toolName: string, impact: Pending.Impact, run: Pending.Run) => {
+      if (!conversationKey) throw new Error("model_confirm_tools: no user message found")
+      const id = Pending.put({
+        sessionID: input.session.id,
+        conversationKey,
+        tool: toolName,
+        impact,
+        run,
+      })
+      return staged(id, toolName, impact)
+    }
+
+    const runWithHooks = async (toolName: string, ctx: Tool.Context, args: unknown, run: () => Promise<any>) => {
+      await Plugin.trigger(
+        "tool.execute.before",
+        {
+          tool: toolName,
+          sessionID: ctx.sessionID,
+          callID: ctx.callID,
+        },
+        {
+          args,
+        },
+      )
+      const result = await run()
+      await Plugin.trigger(
+        "tool.execute.after",
+        {
+          tool: toolName,
+          sessionID: ctx.sessionID,
+          callID: ctx.callID,
+        },
+        result,
+      )
+      return result
+    }
+
+    const formatMcpResult = async (result: any, ctx: Tool.Context) => {
+      const textParts: string[] = []
+      const attachments: MessageV2.FilePart[] = []
+
+      for (const contentItem of result.content) {
+        if (contentItem.type === "text") {
+          textParts.push(contentItem.text)
+        } else if (contentItem.type === "image") {
+          attachments.push({
+            id: Identifier.ascending("part"),
+            sessionID: ctx.sessionID,
+            messageID: ctx.messageID,
+            type: "file",
+            mime: contentItem.mimeType,
+            url: `data:${contentItem.mimeType};base64,${contentItem.data}`,
+          })
+        } else if (contentItem.type === "resource") {
+          const { resource } = contentItem
+          if (resource.text) {
+            textParts.push(resource.text)
+          }
+          if (resource.blob) {
+            attachments.push({
+              id: Identifier.ascending("part"),
+              sessionID: ctx.sessionID,
+              messageID: ctx.messageID,
+              type: "file",
+              mime: resource.mimeType ?? "application/octet-stream",
+              url: `data:${resource.mimeType ?? "application/octet-stream"};base64,${resource.blob}`,
+              filename: resource.uri,
+            })
+          }
+        }
+      }
+
+      const truncated = await Truncate.output(textParts.join("\n\n"), {}, input.agent)
+      const metadata = {
+        ...(result.metadata ?? {}),
+        truncated: truncated.truncated,
+        ...(truncated.truncated && { outputPath: truncated.outputPath }),
+      }
+
+      return {
+        title: "",
+        metadata,
+        output: truncated.content,
+        attachments,
+        content: result.content,
+      }
+    }
+
+    const runMcp = async (toolName: string, args: any, ctx: Tool.Context, opts: ToolCallOptions, exec: any) => {
+      await Plugin.trigger(
+        "tool.execute.before",
+        {
+          tool: toolName,
+          sessionID: ctx.sessionID,
+          callID: ctx.callID,
+        },
+        {
+          args,
+        },
+      )
+
+      await ctx.ask({
+        permission: toolName,
+        metadata: {},
+        patterns: ["*"],
+        always: ["*"],
+      })
+
+      const result = await exec(args, opts)
+
+      await Plugin.trigger(
+        "tool.execute.after",
+        {
+          tool: toolName,
+          sessionID: ctx.sessionID,
+          callID: ctx.callID,
+        },
+        result,
+      )
+
+      return formatMcpResult(result, ctx)
+    }
+
     const context = (args: any, options: ToolCallOptions): Tool.Context => ({
       sessionID: input.session.id,
       abort: options.abortSignal!,
@@ -697,39 +856,28 @@ export namespace SessionPrompt {
       },
     })
 
-    for (const item of await ToolRegistry.tools(
+    const registryTools = await ToolRegistry.tools(
       { modelID: input.model.api.id, providerID: input.model.providerID },
       input.agent,
-    )) {
+    )
+
+    for (const item of registryTools) {
+      const duplicate = tools[item.id] !== undefined
       const schema = ProviderTransform.schema(input.model, z.toJSONSchema(item.parameters))
       tools[item.id] = tool({
         id: item.id as any,
         description: item.description,
         inputSchema: jsonSchema(schema as any),
         async execute(args, options) {
+          const i = impact(item.id, duplicate)
+          if (confirmEnabled && i !== "none" && item.id !== "confirm") {
+            return stage(item.id, i, async (ctx) => {
+              return runWithHooks(item.id, ctx, args, () => item.execute(args, ctx))
+            })
+          }
+
           const ctx = context(args, options)
-          await Plugin.trigger(
-            "tool.execute.before",
-            {
-              tool: item.id,
-              sessionID: ctx.sessionID,
-              callID: ctx.callID,
-            },
-            {
-              args,
-            },
-          )
-          const result = await item.execute(args, ctx)
-          await Plugin.trigger(
-            "tool.execute.after",
-            {
-              tool: item.id,
-              sessionID: ctx.sessionID,
-              callID: ctx.callID,
-            },
-            result,
-          )
-          return result
+          return runWithHooks(item.id, ctx, args, () => item.execute(args, ctx))
         },
       })
     }
@@ -740,89 +888,19 @@ export namespace SessionPrompt {
 
       const transformed = ProviderTransform.schema(input.model, asSchema(item.inputSchema).jsonSchema)
       item.inputSchema = jsonSchema(transformed)
-      // Wrap execute to add plugin hooks and format output
       item.execute = async (args, opts) => {
+        if (confirmEnabled) {
+          return stage(key, "unknown", async (ctx) => {
+            const mcpOpts = {
+              toolCallId: ctx.callID ?? Identifier.ascending("part"),
+              abortSignal: ctx.abort,
+            } as ToolCallOptions
+            return runMcp(key, args, ctx, mcpOpts, execute)
+          })
+        }
+
         const ctx = context(args, opts)
-
-        await Plugin.trigger(
-          "tool.execute.before",
-          {
-            tool: key,
-            sessionID: ctx.sessionID,
-            callID: opts.toolCallId,
-          },
-          {
-            args,
-          },
-        )
-
-        await ctx.ask({
-          permission: key,
-          metadata: {},
-          patterns: ["*"],
-          always: ["*"],
-        })
-
-        const result = await execute(args, opts)
-
-        await Plugin.trigger(
-          "tool.execute.after",
-          {
-            tool: key,
-            sessionID: ctx.sessionID,
-            callID: opts.toolCallId,
-          },
-          result,
-        )
-
-        const textParts: string[] = []
-        const attachments: MessageV2.FilePart[] = []
-
-        for (const contentItem of result.content) {
-          if (contentItem.type === "text") {
-            textParts.push(contentItem.text)
-          } else if (contentItem.type === "image") {
-            attachments.push({
-              id: Identifier.ascending("part"),
-              sessionID: input.session.id,
-              messageID: input.processor.message.id,
-              type: "file",
-              mime: contentItem.mimeType,
-              url: `data:${contentItem.mimeType};base64,${contentItem.data}`,
-            })
-          } else if (contentItem.type === "resource") {
-            const { resource } = contentItem
-            if (resource.text) {
-              textParts.push(resource.text)
-            }
-            if (resource.blob) {
-              attachments.push({
-                id: Identifier.ascending("part"),
-                sessionID: input.session.id,
-                messageID: input.processor.message.id,
-                type: "file",
-                mime: resource.mimeType ?? "application/octet-stream",
-                url: `data:${resource.mimeType ?? "application/octet-stream"};base64,${resource.blob}`,
-                filename: resource.uri,
-              })
-            }
-          }
-        }
-
-        const truncated = await Truncate.output(textParts.join("\n\n"), {}, input.agent)
-        const metadata = {
-          ...(result.metadata ?? {}),
-          truncated: truncated.truncated,
-          ...(truncated.truncated && { outputPath: truncated.outputPath }),
-        }
-
-        return {
-          title: "",
-          metadata,
-          output: truncated.content,
-          attachments,
-          content: result.content, // directly return content to preserve ordering when outputting to model
-        }
+        return runMcp(key, args, ctx, opts, execute)
       }
       tools[key] = item
     }

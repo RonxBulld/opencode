@@ -1132,6 +1132,10 @@ export namespace Config {
             .optional()
             .describe("Tools that should only be available to primary agents."),
           continue_loop_on_deny: z.boolean().optional().describe("Continue the agent loop when a tool call is denied"),
+          model_confirm_tools: z
+            .boolean()
+            .optional()
+            .describe("Require model confirmation before executing side-effecting tools"),
           mcp_timeout: z
             .number()
             .int()
